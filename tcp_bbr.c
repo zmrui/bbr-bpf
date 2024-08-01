@@ -92,6 +92,7 @@ extern unsigned long CONFIG_HZ __kconfig;
 
 // Borrow from kernel
 #define NSEC_PER_USEC	1000L
+#define MSEC_PER_SEC	1000L
 
 // Const value define
 
@@ -152,29 +153,121 @@ __u32 cmpxchg(__u32 * ptr, __u32 old, __u32 new){
   }
 }
 
+#define max_t(type, x, y)	max((type)x, (type)y)
+#define min_t(type, x, y)	min((type)x, (type)y)
+
 // Extern functions
 
-extern unsigned int tcp_left_out(const struct tcp_sock *tp) __ksym;
+// extern unsigned int tcp_left_out(const struct tcp_sock *tp) __ksym;
+static __u32 tcp_left_out(const struct tcp_sock *tp){
+	return tp->sacked_out + tp->lost_out;
+}
 
-extern unsigned int tcp_packets_in_flight(const struct tcp_sock *tp) __ksym;
+// extern unsigned int tcp_packets_in_flight(const struct tcp_sock *tp) __ksym;
+static __u32 tcp_packets_in_flight(const struct tcp_sock *tp){
+	return tp->packets_out - tcp_left_out(tp) + tp->retrans_out;
+}
 
-extern __u32 tcp_stamp_us_delta(__u64 t1, __u64 t0) __ksym;
+// extern __u32 tcp_stamp_us_delta(__u64 t1, __u64 t0) __ksym;
+__u32 tcp_stamp_us_delta(__u64 t1, __u64 t0){
+	return max_t(s64, t1 - t0, 0);
+}
 
-extern __u32 get_random_u32_below(__u32 ceil) __ksym;
+// extern __u32 get_random_u32_below(__u32 ceil) __ksym;
+__u32 get_random_u32_below(__u32 ceil){
+	if(ceil > 0)
+		return ceil -1;
+	else
+		return 0;
+}
 
-extern __u32 tcp_min_rtt(const struct tcp_sock *tp) __ksym;
+// extern  __u32 minmax_get(const struct minmax *m) __ksym;
+__u32 minmax_get(const struct minmax *m){
+	return m->s[0].v;
+}
 
-extern unsigned long msecs_to_jiffies(const unsigned int m)  __ksym;
+// extern __u32 tcp_min_rtt(const struct tcp_sock *tp) __ksym;
+__u32 tcp_min_rtt(const struct tcp_sock *tp){
+	return minmax_get(&tp->rtt_min);
+}
 
-extern __u32 tcp_snd_cwnd(const struct tcp_sock *tp) __ksym;
+// extern unsigned long msecs_to_jiffies(const unsigned int m)  __ksym;
+unsigned long msecs_to_jiffies(const unsigned int m)
+{
+	return (m + (MSEC_PER_SEC / HZ) - 1) / (MSEC_PER_SEC / HZ);
+}
+// extern __u32 tcp_snd_cwnd(const struct tcp_sock *tp) __ksym;
+__u32 tcp_snd_cwnd(const struct tcp_sock *tp){
+	return tp->snd_cwnd;
+}
 
-extern void tcp_snd_cwnd_set(struct tcp_sock *tp, __u32 val) __ksym;
+// extern void tcp_snd_cwnd_set(struct tcp_sock *tp, __u32 val) __ksym;
+void tcp_snd_cwnd_set(struct tcp_sock *tp, __u32 val){
+	tp->snd_cwnd = val;
+}
 
-extern __u32 minmax_running_max(struct minmax *m, __u32 win, __u32 t, __u32 meas) __ksym;
+// extern __u32 minmax_reset(struct minmax *m, u32 t, u32 meas) __ksym;
+__u32 minmax_reset(struct minmax *m, u32 t, u32 meas)
+{
+	struct minmax_sample val = { .t = t, .v = meas };
 
-extern __u32 minmax_reset(struct minmax *m, u32 t, u32 meas) __ksym;
+	m->s[2] = m->s[1] = m->s[0] = val;
+	return m->s[0].v;
+}
+__u32 minmax_subwin_update(struct minmax *m, __u32 win,
+				const struct minmax_sample *val)
+{
+	u32 dt = val->t - m->s[0].t;
 
-extern  __u32 minmax_get(const struct minmax *m) __ksym;
+	if (unlikely(dt > win)) {
+		/*
+		 * Passed entire window without a new val so make 2nd
+		 * choice the new val & 3rd choice the new 2nd choice.
+		 * we may have to iterate this since our 2nd choice
+		 * may also be outside the window (we checked on entry
+		 * that the third choice was in the window).
+		 */
+		m->s[0] = m->s[1];
+		m->s[1] = m->s[2];
+		m->s[2] = *val;
+		if (unlikely(val->t - m->s[0].t > win)) {
+			m->s[0] = m->s[1];
+			m->s[1] = m->s[2];
+			m->s[2] = *val;
+		}
+	} else if (unlikely(m->s[1].t == m->s[0].t) && dt > win/4) {
+		/*
+		 * We've passed a quarter of the window without a new val
+		 * so take a 2nd choice from the 2nd quarter of the window.
+		 */
+		m->s[2] = m->s[1] = *val;
+	} else if (unlikely(m->s[2].t == m->s[1].t) && dt > win/2) {
+		/*
+		 * We've passed half the window without finding a new val
+		 * so take a 3rd choice from the last half of the window
+		 */
+		m->s[2] = *val;
+	}
+	return m->s[0].v;
+}
+
+
+// extern __u32 minmax_running_max(struct minmax *m, __u32 win, __u32 t, __u32 meas) __ksym;
+__u32 minmax_running_max(struct minmax *m, __u32 win, __u32 t, __u32 meas)
+{
+	struct minmax_sample val = { .t = t, .v = meas };
+
+	if (unlikely(val.v >= m->s[0].v) ||	  /* found new max? */
+	    unlikely(val.t - m->s[2].t > win))	  /* nothing left in window? */
+		return minmax_reset(m, t, meas);  /* forget earlier samples */
+
+	if (unlikely(val.v >= m->s[1].v))
+		m->s[2] = m->s[1] = val;
+	else if (unlikely(val.v >= m->s[2].v))
+		m->s[2] = val;
+
+	return minmax_subwin_update(m, win, &val);
+}
 
 char _license[] SEC("license") = "GPL";
 
@@ -371,9 +464,9 @@ static unsigned long bbr_bw_to_pacing_rate(struct sock *sk, __u32	bw, int gain)
 	__u64 rate = bw;
 
 	rate = bbr_rate_bytes_per_sec(sk, rate, gain);
-	// rate = min_t(__u64, rate, READ_ONCE(sk->sk_max_pacing_rate));
+	rate = min_t(__u64, rate, READ_ONCE(sk->sk_max_pacing_rate));
 	//Modified here
-	rate = min(rate, sk->sk_max_pacing_rate);
+	// rate = min(rate, sk->sk_max_pacing_rate);
 	return rate;
 }
 
@@ -431,13 +524,13 @@ static __u32	bbr_tso_segs_goal(struct sock *sk)
 	/* Sort of tcp_tso_autosize() but ignoring
 	 * driver provided sk_gso_max_size.
 	 */
-	// bytes = min_t(unsigned long,
-	// 	      READ_ONCE(sk->sk_pacing_rate) >> READ_ONCE(sk->sk_pacing_shift),
-	// 	      GSO_LEGACY_MAX_SIZE - 1 - MAX_TCP_HEADER);
-	// segs = max_t(u32, bytes / tp->mss_cache, bbr_min_tso_segs(sk));
-	bytes = min(sk->sk_pacing_rate >> sk->sk_pacing_shift,
+	bytes = min_t(unsigned long,
+		      READ_ONCE(sk->sk_pacing_rate) >> READ_ONCE(sk->sk_pacing_shift),
 		      GSO_LEGACY_MAX_SIZE - 1 - MAX_TCP_HEADER);
-	segs = max(bytes / tp->mss_cache, bbr_min_tso_segs(sk));
+	segs = max_t(u32, bytes / tp->mss_cache, bbr_min_tso_segs(sk));
+	// bytes = min(sk->sk_pacing_rate >> sk->sk_pacing_shift,
+	// 	      GSO_LEGACY_MAX_SIZE - 1 - MAX_TCP_HEADER);
+	// segs = max(bytes / tp->mss_cache, bbr_min_tso_segs(sk));
 
 	return min(segs, 0x7FU);
 }
@@ -473,6 +566,13 @@ void BPF_PROG (bpf_bbr_cwnd_event, struct sock *sk, enum tcp_ca_event event)
 			bbr_check_probe_rtt_done(sk);
 	}
 }
+
+// extern void bbr_cwnd_event(struct sock *sk, enum tcp_ca_event event) __ksym;
+
+// SEC("struct_ops")
+// void BPF_PROG (bpf_bbr_cwnd_event, struct sock *sk, enum tcp_ca_event event){
+// 	bbr_cwnd_event(sk,event);
+// }
 
 /* Calculate bdp based on min RTT and the estimated bottleneck bandwidth:
  *
@@ -617,9 +717,9 @@ static bool bbr_set_cwnd_to_recover_or_restore(
 	 * Then, in bbr_set_cwnd() we slow start up toward the target cwnd.
 	 */
 	if (rs->losses > 0)
-		// cwnd = max_t(s32, cwnd - rs->losses, 1);
+		cwnd = max_t(s32, cwnd - rs->losses, 1);
 		//modified here
-		cwnd = max(cwnd - rs->losses, 1);
+		// cwnd = max(cwnd - rs->losses, 1);
 
 	if (state == TCP_CA_Recovery && prev_state != TCP_CA_Recovery) {
 		/* Starting 1st round of Recovery, so do packet conservation. */
@@ -984,10 +1084,10 @@ static void bbr_update_ack_aggregation(struct sock *sk,
 	}
 
 	/* Compute excess data delivered, beyond what was expected. */
-	// bbr->ack_epoch_acked = min_t(u32, 0xFFFFF,
-	// 			     bbr->ack_epoch_acked + rs->acked_sacked);
+	bbr->ack_epoch_acked = min_t(u32, 0xFFFFF,
+				     bbr->ack_epoch_acked + rs->acked_sacked);
 	// modified here
-	bbr->ack_epoch_acked = min(0xFFFFF, bbr->ack_epoch_acked + rs->acked_sacked);
+	// bbr->ack_epoch_acked = min(0xFFFFF, bbr->ack_epoch_acked + rs->acked_sacked);
 	extra_acked = bbr->ack_epoch_acked - expected_acked;
 	extra_acked = min(extra_acked, tcp_snd_cwnd(tp));
 	if (extra_acked > bbr->extra_acked[bbr->extra_acked_win_idx])
