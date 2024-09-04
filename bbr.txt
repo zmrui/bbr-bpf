@@ -1,0 +1,43 @@
+libbpf: loading tcp_bbr.o
+libbpf: elf: section(2) .text, size 5208, link 0, flags 6, type=1
+libbpf: sec '.text': found program 'bbr_set_pacing_rate' at insn offset 244 (1952 bytes), code size 57 insns (456 bytes)
+libbpf: sec '.text': found program 'bbr_lt_bw_sampling' at insn offset 301 (2408 bytes), code size 139 insns (1112 bytes)
+libbpf: sec '.text': found program 'bbr_packets_in_net_at_edt' at insn offset 517 (4136 bytes), code size 76 insns (608 bytes)
+libbpf: sec '.text': found program 'bbr_inflight' at insn offset 593 (4744 bytes), code size 58 insns (464 bytes)
+libbpf: sec '.text': found program 'bbr_reset_lt_bw_sampling' at insn offset 440 (3520 bytes), code size 19 insns (152 bytes)
+libbpf: sec '.text': found program 'bbr_lt_bw_interval_done' at insn offset 459 (3672 bytes), code size 58 insns (464 bytes)
+libbpf: sec '.text': found program 'mydiv' at insn offset 0 (0 bytes), code size 9 insns (72 bytes)
+libbpf: sec '.text': found program 'cmpxchg' at insn offset 9 (72 bytes), code size 9 insns (72 bytes)
+libbpf: sec '.text': found program 'tcp_stamp_us_delta' at insn offset 18 (144 bytes), code size 3 insns (24 bytes)
+libbpf: sec '.text': found program 'get_random_u32_below' at insn offset 21 (168 bytes), code size 8 insns (64 bytes)
+libbpf: sec '.text': found program 'minmax_get' at insn offset 29 (232 bytes), code size 2 insns (16 bytes)
+libbpf: sec '.text': found program 'tcp_min_rtt' at insn offset 31 (248 bytes), code size 4 insns (32 bytes)
+libbpf: sec '.text': found program 'msecs_to_jiffies' at insn offset 35 (280 bytes), code size 12 insns (96 bytes)
+libbpf: sec '.text': found program 'tcp_snd_cwnd' at insn offset 47 (376 bytes), code size 2 insns (16 bytes)
+libbpf: sec '.text': found program 'tcp_snd_cwnd_set' at insn offset 49 (392 bytes), code size 2 insns (16 bytes)
+libbpf: sec '.text': found program 'minmax_reset' at insn offset 51 (408 bytes), code size 24 insns (192 bytes)
+libbpf: sec '.text': found program 'minmax_subwin_update' at insn offset 75 (600 bytes), code size 93 insns (744 bytes)
+libbpf: sec '.text': found program 'minmax_running_max' at insn offset 168 (1344 bytes), code size 76 insns (608 bytes)
+libbpf: elf: section(3) .rel.text, size 32, link 30, flags 40, type=9
+libbpf: elf: section(4) struct_ops, size 8744, link 0, flags 6, type=1
+libbpf: sec 'struct_ops': found program 'bpf_bbr_min_tso_segs' at insn offset 0 (0 bytes), code size 7 insns (56 bytes)
+libbpf: sec 'struct_ops': found program 'bpf_bbr_cwnd_event' at insn offset 7 (56 bytes), code size 72 insns (576 bytes)
+libbpf: sec 'struct_ops': found program 'bpf_bbr_main' at insn offset 79 (632 bytes), code size 812 insns (6496 bytes)
+libbpf: sec 'struct_ops': found program 'bpf_bbr_init' at insn offset 891 (7128 bytes), code size 124 insns (992 bytes)
+libbpf: sec 'struct_ops': found program 'bpf_bbr_sndbuf_expand' at insn offset 1015 (8120 bytes), code size 2 insns (16 bytes)
+libbpf: sec 'struct_ops': found program 'bpf_bbr_undo_cwnd' at insn offset 1017 (8136 bytes), code size 27 insns (216 bytes)
+libbpf: sec 'struct_ops': found program 'bpf_bbr_ssthresh' at insn offset 1044 (8352 bytes), code size 19 insns (152 bytes)
+libbpf: sec 'struct_ops': found program 'bpf_bbr_set_state' at insn offset 1063 (8504 bytes), code size 30 insns (240 bytes)
+libbpf: elf: section(5) .relstruct_ops, size 224, link 30, flags 40, type=9
+libbpf: elf: section(6) license, size 4, link 0, flags 3, type=1
+libbpf: license of tcp_bbr.o is GPL
+libbpf: elf: section(7) .struct_ops, size 192, link 0, flags 3, type=1
+libbpf: elf: section(8) .rel.struct_ops, size 128, link 30, flags 40, type=9
+libbpf: elf: section(9) .rodata.cst32, size 32, link 0, flags 12, type=1
+libbpf: elf: section(20) .BTF, size 35121, link 0, flags 0, type=1
+libbpf: elf: section(22) .BTF.ext, size 17052, link 0, flags 0, type=1
+libbpf: elf: section(30) .symtab, size 4176, link 1, flags 0, type=2
+libbpf: looking for externs among 174 symbols...
+libbpf: collected 1 externs total
+libbpf: extern (kcfg) #0: symbol 158, off 0, name CONFIG_HZ
+libbpf: sec '.rodata': failed to determine size from ELF: size 0, err -2
