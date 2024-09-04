@@ -1,0 +1,501 @@
+From 8a47dca0db75f630439355ba76d3dcb26d5538f4 Mon Sep 17 00:00:00 2001
+From: Mingrui Zhang <mrzhang97@gmail.com>
+Date: Wed, 4 Sep 2024 01:52:22 -0500
+Subject: [PATCH 2/2] bbrv3 to bpf
+
+Signed-off-by: Mingrui Zhang <mrzhang97@gmail.com>
+---
+ tools/testing/selftests/bpf/progs/bpf_bbrv3.c | 401 +++++++++++++-----
+ 1 file changed, 305 insertions(+), 96 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/progs/bpf_bbrv3.c b/tools/testing/selftests/bpf/progs/bpf_bbrv3.c
+index e4963acd3196..af37a6400b58 100644
+--- a/tools/testing/selftests/bpf/progs/bpf_bbrv3.c
++++ b/tools/testing/selftests/bpf/progs/bpf_bbrv3.c
+@@ -56,14 +56,202 @@
+  * otherwise TCP stack falls back to an internal pacing using one high
+  * resolution timer per TCP socket and may use more resources.
+  */
+-#include <linux/btf.h>
+-#include <linux/btf_ids.h>
+-#include <linux/module.h>
+-#include <net/tcp.h>
+-#include <linux/inet_diag.h>
+-#include <linux/inet.h>
+-#include <linux/random.h>
+-#include <linux/win_minmax.h>
++// #include <linux/btf.h>
++// #include <linux/btf_ids.h>
++// #include <linux/module.h>
++// #include <net/tcp.h>
++// #include <linux/inet_diag.h>
++// #include <linux/inet.h>
++// #include <linux/random.h>
++// #include <linux/win_minmax.h>
++#include "bpf_tracing_net.h"
++#include <bpf/bpf_tracing.h>
++#include <bpf/bpf_helpers.h>
++
++extern unsigned long CONFIG_HZ __kconfig;
++#define HZ CONFIG_HZ
++#define USEC_PER_MSEC	1000UL
++#define USEC_PER_SEC	1000000UL
++#define USEC_PER_JIFFY	(USEC_PER_SEC / HZ)
++#define NSEC_PER_USEC	1000L
++#define MSEC_PER_SEC	1000L
++#define GSO_LEGACY_MAX_SIZE	65536u
++#define LL_MAX_HEADER 32
++#define MAX_HEADER LL_MAX_HEADER
++#define MAX_TCP_HEADER	(128 + MAX_HEADER)
++#define TCP_INIT_CWND		10
++#define TCP_INFINITE_SSTHRESH	0x7fffffff
++
++#define WRITE_ONCE(x, val) ((*(volatile typeof(x) *) &(x)) = (val))
++#define READ_ONCE(x) (*(volatile typeof(x) *)&(x))
++#define unlikely(cond) (cond)
++#define clamp(val, lo, hi) min((typeof(val))max(val, lo), hi)
++#define min(a, b) ((a) < (b) ? (a) : (b))
++#define max(a, b) ((a) > (b) ? (a) : (b))
++static bool before(__u32 seq1, __u32 seq2)
++{
++	return (__s32)(seq1-seq2) < 0;
++}
++#define after(seq2, seq1) 	before(seq1, seq2)
++#define max_t(type, x, y)	max((type)x, (type)y)
++#define min_t(type, x, y)	min((type)x, (type)y)
++
++u32 myabs(u32 a, u32 b){
++	if (a > b)
++		return a - b;
++	else
++		return b - a;
++}
++
++u32 div(u64* numer, int denom)
++{
++  u64 res  = *numer / denom;
++  u32 rem = *numer % denom;
++  *numer = res;
++  return rem;
++}
++#define do_div(n, base) div(&n, base);
++
++static inline u64 div_u64_rem(u64 dividend, u32 divisor, u32 *remainder)
++{
++	*remainder = dividend % divisor;
++	return dividend / divisor;
++}
++static inline u64 div_u64(u64 dividend, u32 divisor)
++{
++	u32 remainder;
++	return div_u64_rem(dividend, divisor, &remainder);
++}
++
++s64 sdiv(s64 a, s64 b) {
++	// https://stackoverflow.com/questions/74227051/is-there-a-way-to-perform-signed-division-in-ebpf
++    bool aneg = a < 0;
++    bool bneg = b < 0;
++    // get the absolute positive value of both
++    u64 adiv = aneg ? -a : a;
++    u64 bdiv = bneg ? -b : b;
++    // Do udiv
++    u64 out = adiv / bdiv;
++    // Make output negative if one or the other is negative, not both
++    return aneg != bneg ? -out : out;
++}
++
++static inline s64 div64_s64(s64 dividend, s64 divisor)
++{
++	return sdiv(dividend, divisor);
++}
++#define div64_long(x, y) div64_s64((x), (y))
++
++u32 cmpxchg(u32 * ptr, u32 old, u32 new){
++  if (*ptr == old){
++    *ptr = new;
++    return old;
++  }
++  else{
++    return new;
++  }
++}
++static u32 tcp_left_out(const struct tcp_sock *tp){
++	return tp->sacked_out + tp->lost_out;
++}
++
++static u32 tcp_packets_in_flight(const struct tcp_sock *tp){
++	return tp->packets_out - tcp_left_out(tp) + tp->retrans_out;
++}
++
++u32 tcp_stamp_us_delta(u64 t1, u64 t0){
++	return max_t(s64, t1 - t0, 0);
++}
++
++u32 get_random_u32_below(u32 ceil){
++	if(ceil > 0)
++		return ceil -1;
++	else
++		return 0;
++}
++
++u32 minmax_get(const struct minmax *m){
++	return m->s[0].v;
++}
++
++u32 tcp_min_rtt(const struct tcp_sock *tp){
++	return minmax_get(&tp->rtt_min);
++}
++
++unsigned long msecs_to_jiffies(const unsigned int m)
++{
++	return (m + (MSEC_PER_SEC / HZ) - 1) / (MSEC_PER_SEC / HZ);
++}
++
++u32 tcp_snd_cwnd(const struct tcp_sock *tp){
++	return tp->snd_cwnd;
++}
++
++void tcp_snd_cwnd_set(struct tcp_sock *tp, u32 val){
++	tp->snd_cwnd = val;
++}
++
++u32 minmax_reset(struct minmax *m, u32 t, u32 meas)
++{
++	struct minmax_sample val = { .t = t, .v = meas };
++
++	m->s[2] = m->s[1] = m->s[0] = val;
++	return m->s[0].v;
++}
++u32 minmax_subwin_update(struct minmax *m, u32 win,
++				const struct minmax_sample *val)
++{
++	u32 dt = val->t - m->s[0].t;
++
++	if (unlikely(dt > win)) {
++		/*
++		 * Passed entire window without a new val so make 2nd
++		 * choice the new val & 3rd choice the new 2nd choice.
++		 * we may have to iterate this since our 2nd choice
++		 * may also be outside the window (we checked on entry
++		 * that the third choice was in the window).
++		 */
++		m->s[0] = m->s[1];
++		m->s[1] = m->s[2];
++		m->s[2] = *val;
++		if (unlikely(val->t - m->s[0].t > win)) {
++			m->s[0] = m->s[1];
++			m->s[1] = m->s[2];
++			m->s[2] = *val;
++		}
++	} else if (unlikely(m->s[1].t == m->s[0].t) && dt > win/4) {
++		/*
++		 * We've passed a quarter of the window without a new val
++		 * so take a 2nd choice from the 2nd quarter of the window.
++		 */
++		m->s[2] = m->s[1] = *val;
++	} else if (unlikely(m->s[2].t == m->s[1].t) && dt > win/2) {
++		/*
++		 * We've passed half the window without finding a new val
++		 * so take a 3rd choice from the last half of the window
++		 */
++		m->s[2] = *val;
++	}
++	return m->s[0].v;
++}
++
++u32 minmax_running_max(struct minmax *m, u32 win, u32 t, u32 meas)
++{
++	struct minmax_sample val = { .t = t, .v = meas };
++
++	if (unlikely(val.v >= m->s[0].v) ||	  /* found new max? */
++	    unlikely(val.t - m->s[2].t > win))	  /* nothing left in window? */
++		return minmax_reset(m, t, meas);  /* forget earlier samples */
++
++	if (unlikely(val.v >= m->s[1].v))
++		m->s[2] = m->s[1] = val;
++	else if (unlikely(val.v >= m->s[2].v))
++		m->s[2] = val;
++
++	return minmax_subwin_update(m, win, &val);
++}
++
++char _license[] SEC("license") = "GPL";
+ 
+ /* Scale factor for rate in pkt/uSec unit to avoid truncation in bandwidth
+  * estimation. The rate unit ~= (1500 bytes / 1 usec / 2^24) ~= 715 bps.
+@@ -296,7 +484,13 @@ static void bbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
+ }
+ 
+ /* override sysctl_tcp_min_tso_segs */
+-__bpf_kfunc static u32 bbr_min_tso_segs(struct sock *sk)
++static u32 bbr_min_tso_segs(struct sock *sk)
++{
++	return READ_ONCE(sk->sk_pacing_rate) < (bbr_min_tso_rate >> 3) ? 1 : 2;
++}
++
++SEC("struct_ops")
++u32 BPF_PROG (bpf_bbr_min_tso_segs,struct sock *sk)
+ {
+ 	return READ_ONCE(sk->sk_pacing_rate) < (bbr_min_tso_rate >> 3) ? 1 : 2;
+ }
+@@ -329,7 +523,9 @@ static void bbr_save_cwnd(struct sock *sk)
+ 		bbr->prior_cwnd = max(bbr->prior_cwnd, tcp_snd_cwnd(tp));
+ }
+ 
+-__bpf_kfunc static void bbr_cwnd_event(struct sock *sk, enum tcp_ca_event event)
++SEC("struct_ops")
++void BPF_PROG (bpf_bbr_cwnd_event, struct sock *sk, enum tcp_ca_event event)
++// __bpf_kfunc static void bbr_cwnd_event(struct sock *sk, enum tcp_ca_event event)
+ {
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 	struct bbr *bbr = inet_csk_ca(sk);
+@@ -662,7 +858,8 @@ static void bbr_lt_bw_interval_done(struct sock *sk, u32 bw)
+ 
+ 	if (bbr->lt_bw) {  /* do we have bw from a previous interval? */
+ 		/* Is new bw close to the lt_bw from the previous interval? */
+-		diff = abs(bw - bbr->lt_bw);
++		// diff = abs(bw - bbr->lt_bw);
++		diff = myabs(bw, bbr->lt_bw);
+ 		if ((diff * BBR_UNIT <= bbr_lt_bw_ratio * bbr->lt_bw) ||
+ 		    (bbr_rate_bytes_per_sec(sk, diff, BBR_UNIT) <=
+ 		     bbr_lt_bw_diff)) {
+@@ -1008,7 +1205,7 @@ static void bbr_update_gains(struct sock *sk)
+ 		bbr->cwnd_gain	 = BBR_UNIT;
+ 		break;
+ 	default:
+-		WARN_ONCE(1, "BBR bad mode: %u\n", bbr->mode);
++		// WARN_ONCE(1, "BBR bad mode: %u\n", bbr->mode);
+ 		break;
+ 	}
+ }
+@@ -1023,8 +1220,9 @@ static void bbr_update_model(struct sock *sk, const struct rate_sample *rs)
+ 	bbr_update_min_rtt(sk, rs);
+ 	bbr_update_gains(sk);
+ }
+-
+-__bpf_kfunc static void bbr_main(struct sock *sk, u32 ack, int flag, const struct rate_sample *rs)
++SEC("struct_ops")
++void BPF_PROG(bpf_bbr_main, struct sock *sk, u32 ack, int flag, const struct rate_sample *rs)
++// __bpf_kfunc static void bbr_main(struct sock *sk, u32 ack, int flag, const struct rate_sample *rs)
+ {
+ 	struct bbr *bbr = inet_csk_ca(sk);
+ 	u32 bw;
+@@ -1036,7 +1234,9 @@ __bpf_kfunc static void bbr_main(struct sock *sk, u32 ack, int flag, const struc
+ 	bbr_set_cwnd(sk, rs, rs->acked_sacked, bw, bbr->cwnd_gain);
+ }
+ 
+-__bpf_kfunc static void bbr_init(struct sock *sk)
++SEC("struct_ops")
++void BPF_PROG (bpf_bbr_init,struct sock *sk)
++// __bpf_kfunc static void bbr_init(struct sock *sk)
+ {
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 	struct bbr *bbr = inet_csk_ca(sk);
+@@ -1078,7 +1278,9 @@ __bpf_kfunc static void bbr_init(struct sock *sk)
+ 	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
+ }
+ 
+-__bpf_kfunc static u32 bbr_sndbuf_expand(struct sock *sk)
++SEC("struct_ops")
++u32 BPF_PROG (bpf_bbr_sndbuf_expand, struct sock *sk)
++// __bpf_kfunc static u32 bbr_sndbuf_expand(struct sock *sk)
+ {
+ 	/* Provision 3 * cwnd since BBR may slow-start even during recovery. */
+ 	return 3;
+@@ -1087,7 +1289,9 @@ __bpf_kfunc static u32 bbr_sndbuf_expand(struct sock *sk)
+ /* In theory BBR does not need to undo the cwnd since it does not
+  * always reduce cwnd on losses (see bbr_main()). Keep it for now.
+  */
+-__bpf_kfunc static u32 bbr_undo_cwnd(struct sock *sk)
++SEC("struct_ops")
++u32 BPF_PROG (bpf_bbr_undo_cwnd, struct sock *sk)
++// __bpf_kfunc static u32 bbr_undo_cwnd(struct sock *sk)
+ {
+ 	struct bbr *bbr = inet_csk_ca(sk);
+ 
+@@ -1098,35 +1302,39 @@ __bpf_kfunc static u32 bbr_undo_cwnd(struct sock *sk)
+ }
+ 
+ /* Entering loss recovery, so save cwnd for when we exit or undo recovery. */
+-__bpf_kfunc static u32 bbr_ssthresh(struct sock *sk)
++SEC("struct_ops")
++u32 BPF_PROG (bpf_bbr_ssthresh, struct sock *sk)
++// __bpf_kfunc static u32 bbr_ssthresh(struct sock *sk)
+ {
+ 	bbr_save_cwnd(sk);
+ 	return tcp_sk(sk)->snd_ssthresh;
+ }
+ 
+-static size_t bbr_get_info(struct sock *sk, u32 ext, int *attr,
+-			   union tcp_cc_info *info)
+-{
+-	if (ext & (1 << (INET_DIAG_BBRINFO - 1)) ||
+-	    ext & (1 << (INET_DIAG_VEGASINFO - 1))) {
+-		struct tcp_sock *tp = tcp_sk(sk);
+-		struct bbr *bbr = inet_csk_ca(sk);
+-		u64 bw = bbr_bw(sk);
+-
+-		bw = bw * tp->mss_cache * USEC_PER_SEC >> BW_SCALE;
+-		memset(&info->bbr, 0, sizeof(info->bbr));
+-		info->bbr.bbr_bw_lo		= (u32)bw;
+-		info->bbr.bbr_bw_hi		= (u32)(bw >> 32);
+-		info->bbr.bbr_min_rtt		= bbr->min_rtt_us;
+-		info->bbr.bbr_pacing_gain	= bbr->pacing_gain;
+-		info->bbr.bbr_cwnd_gain		= bbr->cwnd_gain;
+-		*attr = INET_DIAG_BBRINFO;
+-		return sizeof(info->bbr);
+-	}
+-	return 0;
+-}
+-
+-__bpf_kfunc static void bbr_set_state(struct sock *sk, u8 new_state)
++// static size_t bbr_get_info(struct sock *sk, u32 ext, int *attr,
++// 			   union tcp_cc_info *info)
++// {
++// 	if (ext & (1 << (INET_DIAG_BBRINFO - 1)) ||
++// 	    ext & (1 << (INET_DIAG_VEGASINFO - 1))) {
++// 		struct tcp_sock *tp = tcp_sk(sk);
++// 		struct bbr *bbr = inet_csk_ca(sk);
++// 		u64 bw = bbr_bw(sk);
++
++// 		bw = bw * tp->mss_cache * USEC_PER_SEC >> BW_SCALE;
++// 		memset(&info->bbr, 0, sizeof(info->bbr));
++// 		info->bbr.bbr_bw_lo		= (u32)bw;
++// 		info->bbr.bbr_bw_hi		= (u32)(bw >> 32);
++// 		info->bbr.bbr_min_rtt		= bbr->min_rtt_us;
++// 		info->bbr.bbr_pacing_gain	= bbr->pacing_gain;
++// 		info->bbr.bbr_cwnd_gain		= bbr->cwnd_gain;
++// 		*attr = INET_DIAG_BBRINFO;
++// 		return sizeof(info->bbr);
++// 	}
++// 	return 0;
++// }
++
++SEC("struct_ops")
++void BPF_PROG (bpf_bbr_set_state, struct sock *sk, u8 new_state)
++// __bpf_kfunc static void bbr_set_state(struct sock *sk, u8 new_state)
+ {
+ 	struct bbr *bbr = inet_csk_ca(sk);
+ 
+@@ -1140,60 +1348,61 @@ __bpf_kfunc static void bbr_set_state(struct sock *sk, u8 new_state)
+ 	}
+ }
+ 
+-static struct tcp_congestion_ops tcp_bbr_cong_ops __read_mostly = {
+-	.flags		= TCP_CONG_NON_RESTRICTED,
+-	.name		= "bbr",
+-	.owner		= THIS_MODULE,
+-	.init		= bbr_init,
+-	.cong_control	= bbr_main,
+-	.sndbuf_expand	= bbr_sndbuf_expand,
+-	.undo_cwnd	= bbr_undo_cwnd,
+-	.cwnd_event	= bbr_cwnd_event,
+-	.ssthresh	= bbr_ssthresh,
+-	.min_tso_segs	= bbr_min_tso_segs,
+-	.get_info	= bbr_get_info,
+-	.set_state	= bbr_set_state,
+-};
+-
+-BTF_KFUNCS_START(tcp_bbr_check_kfunc_ids)
+-BTF_ID_FLAGS(func, bbr_init)
+-BTF_ID_FLAGS(func, bbr_main)
+-BTF_ID_FLAGS(func, bbr_sndbuf_expand)
+-BTF_ID_FLAGS(func, bbr_undo_cwnd)
+-BTF_ID_FLAGS(func, bbr_cwnd_event)
+-BTF_ID_FLAGS(func, bbr_ssthresh)
+-BTF_ID_FLAGS(func, bbr_min_tso_segs)
+-BTF_ID_FLAGS(func, bbr_set_state)
+-BTF_KFUNCS_END(tcp_bbr_check_kfunc_ids)
+-
+-static const struct btf_kfunc_id_set tcp_bbr_kfunc_set = {
+-	.owner = THIS_MODULE,
+-	.set   = &tcp_bbr_check_kfunc_ids,
++SEC(".struct_ops")
++struct tcp_congestion_ops tcp_bbr_cong_ops = {
++	// .flags		= TCP_CONG_NON_RESTRICTED,
++	.name		= "bbrv3",
++	// .owner		= THIS_MODULE,
++	.init		= (void *)bpf_bbr_init,
++	.cong_control	= (void *)bpf_bbr_main,
++	.sndbuf_expand	= (void *)bpf_bbr_sndbuf_expand,
++	.undo_cwnd	= (void *)bpf_bbr_undo_cwnd,
++	.cwnd_event	= (void *)bpf_bbr_cwnd_event,
++	.ssthresh	= (void *)bpf_bbr_ssthresh,
++	.min_tso_segs	= (void *)bpf_bbr_min_tso_segs,
++	// .get_info	= bbr_get_info,
++	.set_state	= (void *)bpf_bbr_set_state,
+ };
+ 
+-static int __init bbr_register(void)
+-{
+-	int ret;
+-
+-	BUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
+-
+-	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &tcp_bbr_kfunc_set);
+-	if (ret < 0)
+-		return ret;
+-	return tcp_register_congestion_control(&tcp_bbr_cong_ops);
+-}
+-
+-static void __exit bbr_unregister(void)
+-{
+-	tcp_unregister_congestion_control(&tcp_bbr_cong_ops);
+-}
+-
+-module_init(bbr_register);
+-module_exit(bbr_unregister);
+-
+-MODULE_AUTHOR("Van Jacobson <vanj@google.com>");
+-MODULE_AUTHOR("Neal Cardwell <ncardwell@google.com>");
+-MODULE_AUTHOR("Yuchung Cheng <ycheng@google.com>");
+-MODULE_AUTHOR("Soheil Hassas Yeganeh <soheil@google.com>");
+-MODULE_LICENSE("Dual BSD/GPL");
+-MODULE_DESCRIPTION("TCP BBR (Bottleneck Bandwidth and RTT)");
+\ No newline at end of file
++// BTF_KFUNCS_START(tcp_bbr_check_kfunc_ids)
++// BTF_ID_FLAGS(func, bbr_init)
++// BTF_ID_FLAGS(func, bbr_main)
++// BTF_ID_FLAGS(func, bbr_sndbuf_expand)
++// BTF_ID_FLAGS(func, bbr_undo_cwnd)
++// BTF_ID_FLAGS(func, bbr_cwnd_event)
++// BTF_ID_FLAGS(func, bbr_ssthresh)
++// BTF_ID_FLAGS(func, bbr_min_tso_segs)
++// BTF_ID_FLAGS(func, bbr_set_state)
++// BTF_KFUNCS_END(tcp_bbr_check_kfunc_ids)
++
++// static const struct btf_kfunc_id_set tcp_bbr_kfunc_set = {
++// 	.owner = THIS_MODULE,
++// 	.set   = &tcp_bbr_check_kfunc_ids,
++// };
++
++// static int __init bbr_register(void)
++// {
++// 	int ret;
++
++// 	BUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
++
++// 	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &tcp_bbr_kfunc_set);
++// 	if (ret < 0)
++// 		return ret;
++// 	return tcp_register_congestion_control(&tcp_bbr_cong_ops);
++// }
++
++// static void __exit bbr_unregister(void)
++// {
++// 	tcp_unregister_congestion_control(&tcp_bbr_cong_ops);
++// }
++
++// module_init(bbr_register);
++// module_exit(bbr_unregister);
++
++// MODULE_AUTHOR("Van Jacobson <vanj@google.com>");
++// MODULE_AUTHOR("Neal Cardwell <ncardwell@google.com>");
++// MODULE_AUTHOR("Yuchung Cheng <ycheng@google.com>");
++// MODULE_AUTHOR("Soheil Hassas Yeganeh <soheil@google.com>");
++// MODULE_LICENSE("Dual BSD/GPL");
++// MODULE_DESCRIPTION("TCP BBR (Bottleneck Bandwidth and RTT)");
+\ No newline at end of file
+-- 
+2.34.1
+
